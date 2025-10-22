@@ -6,7 +6,7 @@ import re
 import sys
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Any
 
@@ -57,6 +57,13 @@ def _configure_trace_level() -> None:
 
 _configure_trace_level()
 logger = logging.getLogger("names")
+
+
+import ctypes
+
+def set_powershell_window_title(title):
+    """Sets the title of the current PowerShell window."""
+    ctypes.windll.kernel32.SetConsoleTitleW(title)
 
 
 @dataclass
@@ -172,6 +179,11 @@ def parse_args(argv: List[str] | None) -> Namespace:
         action="store_true",
         help="Ignore existing cache entries and revalidate all files.",
     )
+    parser.add_argument(
+        "--force-confirm",
+        action="store_true",
+        help="Treat all scanned files as confirmed matches, overriding mismatches.",
+    )
     return parser.parse_args(argv)
 
 
@@ -276,6 +288,10 @@ def make_openai_client() -> OpenAIChatClient:
     return client
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def format_movie_identifier(title: str, year: int | None) -> str:
     if year:
         return f"{title} ({year})"
@@ -373,6 +389,7 @@ def evaluate_movie_files(
     movie,
     cache: Dict[str, Dict[str, Any]],
     refresh_cache: bool,
+    force_confirm: bool,
 ) -> Tuple[List[Dict[str, object]], bool]:
     title = getattr(movie, "title", "Unknown Title")
     year = getattr(movie, "year", None)
@@ -386,6 +403,7 @@ def evaluate_movie_files(
     for path in paths:
         base = filename_from_path(path)
         cache_entry = cache.get(path)
+        parent_folder = os.path.basename(os.path.dirname(path))
 
         if cache_entry and cache_entry.get("match") and not refresh_cache:
             logger.debug(
@@ -407,7 +425,7 @@ def evaluate_movie_files(
             continue
 
         if heuristic_match(title, base):
-            logger.debug(
+            logger.info(
                 "Heuristic match succeeded for '%s' -> '%s'", title, base
             )
             result = {
@@ -427,7 +445,33 @@ def evaluate_movie_files(
                 "method": result["method"],
                 "title": title,
                 "year": year,
-                "verified_at": datetime.utcnow().isoformat() + "Z",
+                "verified_at": utc_now_iso(),
+            }
+            cache_modified = True
+            continue
+
+        if parent_folder and heuristic_match(title, parent_folder):
+            logger.info(
+                "Folder-based heuristic match for '%s' -> '%s'", title, parent_folder
+            )
+            result = {
+                "path": path,
+                "filename": base,
+                "match": True,
+                "confidence": 0.9,
+                "reason": "Parent folder name matches title.",
+                "method": "heuristic-folder",
+                "cached": False,
+            }
+            results.append(result)
+            cache[path] = {
+                "match": True,
+                "confidence": result["confidence"],
+                "reason": result["reason"],
+                "method": result["method"],
+                "title": title,
+                "year": year,
+                "verified_at": utc_now_iso(),
             }
             cache_modified = True
             continue
@@ -461,17 +505,34 @@ def evaluate_movie_files(
             "method": "openai",
             "cached": False,
         }
+
+        if not match and force_confirm:
+            logger.warning(
+                "Force-confirm enabled; overriding mismatch for '%s'.", path
+            )
+            match = True
+            confidence = 1.0
+            reason = "Force-confirm override applied."
+            result.update(
+                {
+                    "match": True,
+                    "confidence": confidence,
+                    "reason": reason,
+                    "method": "forced",
+                }
+            )
+
         results.append(result)
 
         if match:
             cache[path] = {
-                "match": match,
+                "match": True,
                 "confidence": confidence,
                 "reason": reason,
-                "method": "openai",
+                "method": result["method"],
                 "title": title,
                 "year": year,
-                "verified_at": datetime.utcnow().isoformat() + "Z",
+                "verified_at": utc_now_iso(),
             }
             cache_modified = True
         elif cache_entry:
@@ -482,6 +543,7 @@ def evaluate_movie_files(
 
 
 def main(argv: List[str] | None = None) -> None:
+    set_powershell_window_title("Plex Movie Filename Validator")
     try:
         args = parse_args(argv)
         configure_logging(args.log_level)
@@ -515,7 +577,7 @@ def main(argv: List[str] | None = None) -> None:
         for movie in movies:
             logger.info("Evaluating '%s'", getattr(movie, "title", "Unknown Title"))
             movie_results, cache_changed = evaluate_movie_files(
-                client, movie, cache, args.refresh_cache
+                client, movie, cache, args.refresh_cache, args.force_confirm
             )
             total_checks += len(movie_results)
             cache_dirty = cache_dirty or cache_changed
