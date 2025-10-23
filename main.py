@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean, median
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List
 
 try:
     from plexapi.exceptions import NotFound, Unauthorized
@@ -133,6 +133,8 @@ def analyze_movies(movies: Iterable) -> Dict[str, object]:
     duration_entries = []
     ratings = []
     rating_entries = []
+    actor_rating_totals: Dict[str, List[float]] = {}
+    director_rating_totals: Dict[str, List[float]] = {}
     release_years = []
     release_entries = []
     addition_dates = []
@@ -187,13 +189,19 @@ def analyze_movies(movies: Iterable) -> Dict[str, object]:
             rating_entries.append((title, rating_value))
 
         # Cast & crew breakdowns
-        for actor in getattr(movie, "actors", []) or []:
+        actors = getattr(movie, "actors", []) or []
+        for actor in actors:
             if actor.tag:
                 actor_counts[actor.tag] += 1
+                if isinstance(rating, (int, float)):
+                    actor_rating_totals.setdefault(actor.tag, []).append(float(rating))
 
-        for director in getattr(movie, "directors", []) or []:
+        directors = getattr(movie, "directors", []) or []
+        for director in directors:
             if director.tag:
                 director_counts[director.tag] += 1
+                if isinstance(rating, (int, float)):
+                    director_rating_totals.setdefault(director.tag, []).append(float(rating))
 
         for genre in getattr(movie, "genres", []) or []:
             if genre.tag:
@@ -296,6 +304,52 @@ def analyze_movies(movies: Iterable) -> Dict[str, object]:
         "above_threshold_count": sum(1 for _, value in rating_entries if value >= 8.0),
     }
 
+    def compute_rankings(
+        rating_map: Dict[str, List[float]],
+        count_map: Counter[str],
+        global_average: float | None,
+        smoothing: int = 3,
+    ) -> Dict[str, Dict[str, object]]:
+        if not rating_map:
+            return {
+                "highest": {"name": "n/a", "average": 0.0, "count": 0, "weighted": 0.0},
+                "lowest": {"name": "n/a", "average": 0.0, "count": 0, "weighted": 0.0},
+            }
+
+        prior = global_average if isinstance(global_average, (int, float)) else 0.0
+        aggregates = []
+        for name, values in rating_map.items():
+            if not values:
+                continue
+            count = count_map.get(name, len(values))
+            average_rating = mean(values)
+            weighted_rating = ((count / (count + smoothing)) * average_rating) + (
+                (smoothing / (count + smoothing)) * prior
+            )
+            aggregates.append(
+                {
+                    "name": name,
+                    "average": average_rating,
+                    "count": count,
+                    "weighted": weighted_rating,
+                }
+            )
+
+        if not aggregates:
+            return {
+                "highest": {"name": "n/a", "average": 0.0, "count": 0, "weighted": 0.0},
+                "lowest": {"name": "n/a", "average": 0.0, "count": 0, "weighted": 0.0},
+            }
+
+        highest = max(aggregates, key=lambda entry: entry["weighted"])
+        lowest = min(aggregates, key=lambda entry: entry["weighted"])
+        return {"highest": highest, "lowest": lowest}
+
+    person_rating_rankings = {
+        "actor": compute_rankings(actor_rating_totals, actor_counts, rating_stats["average"]),
+        "director": compute_rankings(director_rating_totals, director_counts, rating_stats["average"]),
+    }
+
     year_stats = {
         "average": mean(release_years) if release_years else None,
         "median": median(release_years) if release_years else None,
@@ -353,6 +407,7 @@ def analyze_movies(movies: Iterable) -> Dict[str, object]:
         "source_counts": source_counts,
         "duration_stats": duration_stats,
         "rating_stats": rating_stats,
+        "person_rating_rankings": person_rating_rankings,
         "year_stats": year_stats,
         "addition_stats": addition_stats,
         "watch_stats": watch_stats,
@@ -489,6 +544,39 @@ def main() -> None:
             print("  Lowest rated:")
             for title, value in rating_stats["lowest"]:
                 print(f"    {title}: {value:.2f}")
+        person_rating_rankings = analysis.get("person_rating_rankings", {})
+        actor_rank = person_rating_rankings.get("actor")
+        director_rank = person_rating_rankings.get("director")
+        if actor_rank:
+            highest_actor = actor_rank["highest"]
+            lowest_actor = actor_rank["lowest"]
+            if highest_actor["name"] != "n/a":
+                print(
+                    "  Actor highest avg rating: "
+                    f"{highest_actor['name']} ({highest_actor['average']:.2f} avg over "
+                    f"{highest_actor['count']} films, weighted {highest_actor['weighted']:.2f})"
+                )
+            if lowest_actor["name"] != "n/a":
+                print(
+                    "  Actor lowest avg rating: "
+                    f"{lowest_actor['name']} ({lowest_actor['average']:.2f} avg over "
+                    f"{lowest_actor['count']} films, weighted {lowest_actor['weighted']:.2f})"
+                )
+        if director_rank:
+            highest_director = director_rank["highest"]
+            lowest_director = director_rank["lowest"]
+            if highest_director["name"] != "n/a":
+                print(
+                    "  Director highest avg rating: "
+                    f"{highest_director['name']} ({highest_director['average']:.2f} avg over "
+                    f"{highest_director['count']} films, weighted {highest_director['weighted']:.2f})"
+                )
+            if lowest_director["name"] != "n/a":
+                print(
+                    "  Director lowest avg rating: "
+                    f"{lowest_director['name']} ({lowest_director['average']:.2f} avg over "
+                    f"{lowest_director['count']} films, weighted {lowest_director['weighted']:.2f})"
+                )
 
         year_stats = analysis["year_stats"]
         print("\nRelease Timeline")
