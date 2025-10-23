@@ -1,17 +1,27 @@
-from __future__ import annotations
-
 import argparse
 import logging
 import os
 import sys
 import threading
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from queue import Empty, Queue
 from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Tuple
 
-import PySimpleGUI as sg  # type: ignore
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    from tkinter.scrolledtext import ScrolledText
+except ImportError as exc:
+    sys.stderr.write(
+        "Tkinter is not available in this Python installation.\n"
+        "Please install or enable Tkinter and try again.\n"
+        f"Error: {exc}\n"
+    )
+    sys.stderr.flush()
+    sys.exit(1)
 
 try:
     from plexapi.exceptions import NotFound, Unauthorized
@@ -60,9 +70,10 @@ def parse_args(argv: List[str] | None) -> argparse.Namespace:
         help="Logging level (default: info).",
     )
     parser.add_argument(
-        "--theme",
-        default="SystemDefault",
-        help="PySimpleGUI theme name (default: SystemDefault).",
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 4) // 2),
+        help="Number of parallel worker threads for analysis (default: half of CPU cores).",
     )
     return parser.parse_args(argv)
 
@@ -385,6 +396,42 @@ class AnalysisAccumulator:
         if not (getattr(movie, "genres", []) or []):
             self.metadata_gaps["missing_genre"] += 1
 
+    def combine(self, other: "AnalysisAccumulator") -> None:
+        self.actor_counts.update(other.actor_counts)
+        self.director_counts.update(other.director_counts)
+        self.genre_counts.update(other.genre_counts)
+        self.content_rating_counts.update(other.content_rating_counts)
+        self.language_counts.update(other.language_counts)
+        self.country_counts.update(other.country_counts)
+        self.collection_counts.update(other.collection_counts)
+        self.resolution_counts.update(other.resolution_counts)
+        self.hdr_counts.update(other.hdr_counts)
+        self.audio_channel_counts.update(other.audio_channel_counts)
+        self.source_counts.update(other.source_counts)
+        self.release_year_counts.update(other.release_year_counts)
+        self.release_decade_counts.update(other.release_decade_counts)
+        self.added_year_counts.update(other.added_year_counts)
+        self.added_month_counts.update(other.added_month_counts)
+
+        self.durations_minutes.extend(other.durations_minutes)
+        self.duration_entries.extend(other.duration_entries)
+        self.ratings.extend(other.ratings)
+        self.rating_entries.extend(other.rating_entries)
+        for name, values in other.actor_rating_totals.items():
+            self.actor_rating_totals[name].extend(values)
+        for name, values in other.director_rating_totals.items():
+            self.director_rating_totals[name].extend(values)
+        self.release_years.extend(other.release_years)
+        self.release_entries.extend(other.release_entries)
+        self.addition_dates.extend(other.addition_dates)
+        self.addition_entries.extend(other.addition_entries)
+        self.view_entries.extend(other.view_entries)
+        self.last_view_dates.extend(other.last_view_dates)
+        self.metadata_gaps.update(other.metadata_gaps)
+
+        self.total_movies += other.total_movies
+        self.total_view_count += other.total_view_count
+
     def finalize(self) -> Dict[str, Any]:
         duration_stats = {
             "average_minutes": mean(self.durations_minutes) if self.durations_minutes else 0,
@@ -398,10 +445,10 @@ class AnalysisAccumulator:
         rating_stats = {
             "average": mean(self.ratings) if self.ratings else None,
             "median": median(self.ratings) if self.ratings else None,
-            "highest": sorted(self.rating_entries, key=lambda entry: entry[1], reverse=True)[:5],
-            "lowest": sorted(self.rating_entries, key=lambda entry: entry[1])[:5],
-            "threshold": 8.0,
-            "above_threshold_count": sum(1 for _, value in self.rating_entries if value >= 8.0),
+            "highest": sorted(self.rating_entries, key=lambda entry: entry[1], reverse=True)[:25],
+            "lowest": sorted(self.rating_entries, key=lambda entry: entry[1])[:25],
+            "threshold": 9.0,
+            "above_threshold_count": sum(1 for _, value in self.rating_entries if value >= 9.0),
         }
 
         def compute_rankings(
@@ -511,6 +558,37 @@ class AnalysisAccumulator:
         }
 
 
+def chunk_movies(movies: List, chunks: int) -> List[List]:
+    if chunks <= 1 or len(movies) <= chunks:
+        return [movies]
+    chunk_size = (len(movies) + chunks - 1) // chunks
+    return [movies[i : i + chunk_size] for i in range(0, len(movies), chunk_size)]
+
+
+def analyze_chunk(movie_chunk: List) -> AnalysisAccumulator:
+    accumulator = AnalysisAccumulator()
+    for movie in movie_chunk:
+        accumulator.add_movie(movie)
+    return accumulator
+
+
+# due to PowerShell here-string size limitations. Please rerun this script with a
+# smaller chunk size or use a different method to write the file.
+
+def chunk_movies(movies: List, chunks: int)->List[List]:
+    if chunks <= 1 or len(movies) <= chunks:
+        return [movies]
+    chunk_size = (len(movies) + chunks - 1)/chunks
+    # ensure chunk_size is an integer
+    chunk_size = int(chunk_size)
+    return [movies[i : i + chunk_size] for i in range(0, len(movies), chunk_size)]
+    
+def analyze_chunk(movie_chunk: List) -> AnalysisAccumulator:
+    accumulator = AnalysisAccumulator()
+    for movie in movie_chunk:
+        accumulator.add_movie(movie)
+    return accumulator
+    
 def format_runtime_section(duration_stats: Dict[str, Any], total_movies: int) -> str:
     lines = []
     avg_minutes = duration_stats["average_minutes"]
@@ -560,7 +638,7 @@ def format_ratings_section(analysis: Dict[str, Any]) -> str:
     def format_person_rank(label: str, data: Dict[str, Dict[str, object]]) -> List[str]:
         highest = data["highest"]
         lowest = data["lowest"]
-        results = []
+        results: List[str] = []
         if highest["name"] != "n/a":
             results.append(
                 f"{label} highest avg rating: {highest['name']} ({highest['average']:.2f} avg over "
@@ -722,38 +800,38 @@ def format_sections(analysis: Dict[str, Any]) -> Dict[str, str]:
 
 
 SECTION_LAYOUT = [
-    ("runtime", "Runtime Profile", (60, 6)),
-    ("ratings", "Ratings", (60, 12)),
-    ("release", "Release Timeline", (60, 9)),
-    ("growth", "Library Growth", (60, 9)),
-    ("watch", "Watch Activity", (60, 7)),
-    ("talent", "Talent & Genres", (60, 11)),
-    ("audience", "Audience & Origins", (60, 11)),
-    ("collections", "Collections & Sources", (60, 10)),
-    ("technical", "Technical Snapshot", (60, 11)),
-    ("metadata", "Metadata Gaps", (60, 7)),
+    ("runtime", "Runtime Profile"),
+    ("ratings", "Ratings"),
+    ("release", "Release Timeline"),
+    ("growth", "Library Growth"),
+    ("watch", "Watch Activity"),
+    ("talent", "Talent & Genres"),
+    ("audience", "Audience & Origins"),
+    ("collections", "Collections & Sources"),
+    ("technical", "Technical Snapshot"),
+    ("metadata", "Metadata Gaps"),
 ]
 
 
-def build_window() -> sg.Window:
-    layout = [
-        [sg.Text("Status:", size=(8, 1)), sg.Text("", key="status", size=(80, 1))],
-    ]
-    for key, title, size in SECTION_LAYOUT:
-        layout.append(
-            [
-                sg.Frame(
-                    title,
-                    [[sg.Multiline("", size=size, key=key, disabled=True, autoscroll=True)]],
-                    expand_x=True,
-                )
-            ]
-        )
-    layout.append([sg.Button("Exit")])
-    return sg.Window("Plex Movie Analytics", layout, finalize=True, resizable=True)
+SECTION_LAYOUT = [
+    ("runtime", "Runtime Profile"),
+    ("ratings", "Ratings"),
+    ("release", "Release Timeline"),
+    ("growth", "Library Growth"),
+    ("watch", "Watch Activity"),
+    ("talent", "Talent & Genres"),
+    ("audience", "Audience & Origins"),
+    ("collections", "Collections & Sources"),
+    ("technical", "Technical Snapshot"),
+    ("metadata", "Metadata Gaps"),
+]
 
-
-def analysis_worker(env: Dict[str, str], message_queue: Queue, stop_event: threading.Event) -> None:
+def analysis_worker(
+    env: Dict[str, str],
+    message_queue: Queue,
+    stop_event: threading.Event,
+    worker_count: int,
+) -> None:
     try:
         message_queue.put(("status", "Connecting to Plex..."))
         plex = connect_to_plex(env["PLEX_URL"], env["PLEX_TOKEN"])
@@ -771,58 +849,148 @@ def analysis_worker(env: Dict[str, str], message_queue: Queue, stop_event: threa
         message_queue.put(("status", f"Processing {total_movies} movies..."))
 
         accumulator = AnalysisAccumulator()
-        for index, movie in enumerate(movies, start=1):
-            if stop_event.is_set():
-                message_queue.put(("status", "Analysis cancelled by user."))
-                return
 
-            accumulator.add_movie(movie)
-            if index % 10 == 0 or index == total_movies:
-                message_queue.put(
-                    ("status", f"Processing {index}/{total_movies}: {getattr(movie, 'title', 'Unknown')}")
-                )
+        use_parallel = worker_count > 1 and total_movies > 1
+        if use_parallel:
+            logger.debug("Running analysis with %d worker threads.", worker_count)
+            chunks = chunk_movies(movies, worker_count)
+            processed = 0
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_size = {executor.submit(analyze_chunk, chunk): len(chunk) for chunk in chunks}
+                for future in as_completed(future_to_size):
+                    if stop_event.is_set():
+                        for pending in future_to_size:
+                            pending.cancel()
+                        message_queue.put(("status", "Analysis cancelled by user."))
+                        return
+                    chunk_accumulator = future.result()
+                    accumulator.combine(chunk_accumulator)
+                    processed += future_to_size[future]
+                    message_queue.put(("status", f"Processed {processed}/{total_movies} movies in parallel..."))
+        else:
+            for index, movie in enumerate(movies, start=1):
+                if stop_event.is_set():
+                    message_queue.put(("status", "Analysis cancelled by user."))
+                    return
+
+                accumulator.add_movie(movie)
+                if index % 10 == 0 or index == total_movies:
+                    message_queue.put(
+                        ("status", f"Processing {index}/{total_movies}: {getattr(movie, 'title', 'Unknown')}")
+                    )
 
         analysis = accumulator.finalize()
         sections = format_sections(analysis)
         for key, text in sections.items():
             message_queue.put(("section", key, text))
 
-        message_queue.put(
-            ("status", f"Analysis complete. Processed {analysis['total_movies']} movies.")
-        )
+        message_queue.put(("status", f"Analysis complete. Processed {analysis['total_movies']} movies."))
     except Exception as exc:  # pragma: no cover - GUI entry point
         logger.exception("Analysis failed")
         message_queue.put(("error", str(exc)))
 
 
-def drain_queue(window: sg.Window, message_queue: Queue) -> None:
-    while True:
-        try:
-            message = message_queue.get_nowait()
-        except Empty:
-            break
+class AnalyticsApp:
+    def __init__(self, env: Dict[str, str], worker_count: int) -> None:
+        self.env = env
+        self.worker_count = max(1, worker_count)
+        self.root = tk.Tk()
+        self.root.title("Plex Movie Analytics")
+        self.root.geometry("960x720")
 
-        message_type = message[0]
-        if message_type == "status":
-            status_text = message[1]
-            logger.info(status_text)
-            window["status"].update(status_text)
-        elif message_type == "section":
-            _, key, text = message
-            if key in window.AllKeysDict:
-                window[key].update(text)
-        elif message_type == "error":
-            error_text = message[1]
-            logger.error("Error from worker: %s", error_text)
-            window["status"].update(f"Error: {error_text}")
+        self.status_var = tk.StringVar(value=f"Initializing ({self.worker_count} worker(s))...")
+        status_label = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
+        status_label.pack(fill="x", padx=12, pady=(12, 6))
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=6)
+
+        self.text_widgets: Dict[str, ScrolledText] = {}
+        for key, title in SECTION_LAYOUT:
+            frame = ttk.Frame(self.notebook)
+            self.notebook.add(frame, text=title)
+            text_widget = ScrolledText(frame, wrap="word", state="disabled")
+            text_widget.pack(fill="both", expand=True)
+            self.text_widgets[key] = text_widget
+
+        button_frame = ttk.Frame(self.root)
+        button_frame.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(button_frame, text="Exit", command=self.on_close).pack(side="right")
+
+        self.message_queue: Queue = Queue()
+        self.stop_event = threading.Event()
+        self.worker_thread = threading.Thread(
+            target=analysis_worker,
+            args=(self.env, self.message_queue, self.stop_event, self.worker_count),
+            daemon=True,
+        )
+        self.worker_thread.start()
+        self.status_var.set(f"Launching analysis with {self.worker_count} worker(s)...")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(200, self.process_queue)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def process_queue(self) -> None:
+        while True:
+            try:
+                message = self.message_queue.get_nowait()
+            except Empty:
+                break
+
+            message_type = message[0]
+            if message_type == "status":
+                status_text = message[1]
+                logger.info(status_text)
+                self.status_var.set(status_text)
+            elif message_type == "section":
+                _, key, text = message
+                self.update_section(key, text)
+            elif message_type == "error":
+                error_text = message[1]
+                logger.error("Error from worker: %s", error_text)
+                self.status_var.set(f"Error: {error_text}")
+            else:
+                logger.debug("Unknown message type received: %s", message_type)
+
+        if not self.stop_event.is_set() or self.worker_thread.is_alive():
+            self.root.after(200, self.process_queue)
+
+    def update_section(self, key: str, text: str) -> None:
+        widget = self.text_widgets.get(key)
+        if not widget:
+            logger.debug("No widget found for key '%s'", key)
+            return
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, text)
+        widget.configure(state="disabled")
+
+    def on_close(self) -> None:
+        if self.stop_event.is_set():
+            if not self.worker_thread.is_alive():
+                self.root.destroy()
+            return
+
+        logger.info("Shutting down analysis...")
+        self.status_var.set("Stopping analysis...")
+        self.stop_event.set()
+        self.root.after(200, self._wait_for_worker)
+
+    def _wait_for_worker(self) -> None:
+        if self.worker_thread.is_alive():
+            self.root.after(200, self._wait_for_worker)
         else:
-            logger.debug("Unknown message type received: %s", message_type)
+            self.root.destroy()
 
 
 def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
     configure_logging(args.log_level)
-    sg.theme(args.theme)
+    logger.info("Starting Plex movie analytics GUI...")
+    logger.debug("Worker threads requested: %d", args.workers)
 
     load_env_file(ENV_FILE)
     try:
@@ -831,28 +999,8 @@ def main(argv: List[str] | None = None) -> None:
         logger.error("Failed to load environment configuration: %s", exc)
         sys.exit(1)
 
-    window = build_window()
-    message_queue: Queue = Queue()
-    stop_event = threading.Event()
-
-    worker_thread = threading.Thread(
-        target=analysis_worker,
-        args=(env, message_queue, stop_event),
-        daemon=True,
-    )
-    worker_thread.start()
-
-    try:
-        while True:
-            event, _ = window.read(timeout=200)
-            if event in (sg.WIN_CLOSED, "Exit"):
-                stop_event.set()
-                break
-            drain_queue(window, message_queue)
-    finally:
-        stop_event.set()
-        worker_thread.join(timeout=5)
-        window.close()
+    app = AnalyticsApp(env, args.workers)
+    app.run()
 
 
 if __name__ == "__main__":
@@ -861,5 +1009,5 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover
         sys.stderr.write(f"Error: {exc}\n")
         sys.exit(1)
-
-
+    else:
+        sys.exit(0)
