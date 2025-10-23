@@ -182,7 +182,9 @@ def analyze_movies(movies: Iterable) -> Dict[str, object]:
             duration_entries.append((title, duration_minutes))
 
         # Rating statistics
-        rating = getattr(movie, "rating", None)
+        rating = getattr(movie, "audienceRating", None)
+        if not isinstance(rating, (int, float)):
+            rating = getattr(movie, "rating", None)
         if isinstance(rating, (int, float)):
             rating_value = float(rating)
             ratings.append(rating_value)
@@ -298,10 +300,10 @@ def analyze_movies(movies: Iterable) -> Dict[str, object]:
     rating_stats = {
         "average": mean(ratings) if ratings else None,
         "median": median(ratings) if ratings else None,
-        "highest": sorted(rating_entries, key=lambda entry: entry[1], reverse=True)[:5],
-        "lowest": sorted(rating_entries, key=lambda entry: entry[1])[:5],
-        "threshold": 8.0,
-        "above_threshold_count": sum(1 for _, value in rating_entries if value >= 8.0),
+        "highest": sorted(rating_entries, key=lambda entry: entry[1], reverse=True)[:10],
+        "lowest": sorted(rating_entries, key=lambda entry: entry[1])[:10],
+        "threshold": 9.0,
+        "above_threshold_count": sum(1 for _, value in rating_entries if value >= 9.0),
     }
 
     def compute_rankings(
