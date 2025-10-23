@@ -216,7 +216,7 @@ def pretty_provider(name: str) -> str:
     return lookup.get(upper_name, upper_name.title())
 
 
-def format_counter(counter: Counter[str], limit: int = 5, transform=lambda value: value) -> str:
+def format_counter(counter: Counter[str], limit: int = 25, transform=lambda value: value) -> str:
     if not counter:
         return "  n/a"
     lines = []
@@ -270,6 +270,7 @@ class AnalysisAccumulator:
         self.total_movies = 0
         self.total_view_count = 0
         self.epic_threshold_minutes = 150
+        self.long_movie_threshold_minutes = 120
 
     def add_movie(self, movie) -> None:
         self.total_movies += 1
@@ -440,6 +441,8 @@ class AnalysisAccumulator:
             "longest": max(self.duration_entries, key=lambda entry: entry[1]) if self.duration_entries else None,
             "epic_count": sum(1 for _, minutes in self.duration_entries if minutes >= self.epic_threshold_minutes),
             "epic_threshold": self.epic_threshold_minutes,
+            "long_movie_count": sum(1 for _, minutes in self.duration_entries if minutes >= self.long_movie_threshold_minutes),
+            "long_movie_threshold": self.long_movie_threshold_minutes,
         }
 
         rating_stats = {
@@ -531,7 +534,7 @@ class AnalysisAccumulator:
         watch_stats = {
             "total_plays": self.total_view_count,
             "movies_watched": len(self.view_entries),
-            "most_watched": sorted(self.view_entries, key=lambda entry: entry[1], reverse=True)[:5],
+            "most_watched": sorted(self.view_entries, key=lambda entry: entry[1], reverse=True)[:25],
             "last_viewed": max(self.last_view_dates) if self.last_view_dates else None,
         }
 
@@ -560,8 +563,10 @@ class AnalysisAccumulator:
 
 def chunk_movies(movies: List, chunks: int) -> List[List]:
     if chunks <= 1 or len(movies) <= chunks:
+        logging.debug("Not chunking movies; total movies: %d, requested chunks: %d", len(movies), chunks)
         return [movies]
     chunk_size = (len(movies) + chunks - 1) // chunks
+    logging.debug("Chunking movies into %d chunks of size %d", chunks, chunk_size)
     return [movies[i : i + chunk_size] for i in range(0, len(movies), chunk_size)]
 
 
@@ -603,6 +608,12 @@ def format_runtime_section(duration_stats: Dict[str, Any], total_movies: int) ->
     if longest:
         title, minutes = longest
         lines.append(f"Longest: {title} ({human_readable_duration(minutes)}, ~{minutes:.0f} min)")
+    long_movie_count = duration_stats["long_movie_count"]
+    long_movie_percent = (long_movie_count / total_movies) * 100 if total_movies else 0
+    lines.append(
+        f"Long movies (>={duration_stats['long_movie_threshold']} min): {long_movie_count} "
+        f"({long_movie_percent:.1f}% of library)"
+    )
     epic_count = duration_stats["epic_count"]
     epic_percent = (epic_count / total_movies) * 100 if total_movies else 0
     lines.append(
